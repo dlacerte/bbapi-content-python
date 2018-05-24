@@ -1,0 +1,339 @@
+#!/usr/bin/python -W ignore::DeprecationWarning
+
+# PROGRAM: bbapi-content 
+# Author: Dave Lacerte  Feb 12 2018
+# Modified: 
+#
+# Uses Blackboard REST API endpoint URLs to perform operations on COURSE CONTENT records 
+# Supported Operations are: 
+# 2) "list" COURSE CONTENT records for a specified COURSEID ( courseid can be TEXT: W_XX-XX-XX-W18 or PK1: _9876543_1 ) 
+# 3) "update" a COURSE CONTNET record with various parameters:
+# 4) "create" a new COURSE CONTENT record for a given courseid:
+# 5) "delete" a COURSE CONTENT record for a given course 
+
+import json
+import requests
+import sys
+import requests.packages.urllib3
+import os
+import pprint
+from bbconstants import *
+from bboauthmod import *
+
+# this line forces python to ignore old/out-dated insecure urllib3 libs and un-verified http CERTS
+requests.packages.urllib3.disable_warnings()
+
+# Set PROXY environment variables so requests modules uses the proxy server
+# Since balsa is behind the ASA firewall
+os.environ["HTTPS_PROXY"] = 'https://your-proxy.net:3128'
+os.environ["HTTP_PROXY"] = 'http://your proxy.net:3128'
+
+# There are five possible API QUERY types which can be sent to the API:
+# GET - get a single or multiple COURSE MEMBERSHIP record(s)
+# POST - create a new COURSE MEMBERSHIP record
+# PATCH - update an existing COURSE MEMBERSHIP USER record 
+# DELETE - delete a COURSE MEMBERSHIP USER record
+# PUT - create new course membership user ( new user enrollment )
+# Set the Default API Query type (initially) to an INVALID value
+QTYPE = 'INVALID'
+
+# process command line arguments passed to this script 
+# Call the bbargs() function in the bbargparsemod module
+from bbargparse_content_mod import bbargs
+args, APIPATH, FIELDS, QTYPE = bbargs()
+
+# Define JSON INPUT strings for various POST/PATCH requests
+# See: https://developer.blackboard.com/portal/displayApi for details or changes to the BB Api specs
+# initial version of the script can change 6 items using six possible command line options after the COURSEID param
+# This function strips out any keys in a dict which have no value paired with them (None values) 
+def strip_None_keys(dict):
+	for elem in dict.keys():
+		if dict[elem] is False :
+			del dict[elem]
+	return dict
+
+# create an empty User Input dictioanry (ui)
+# there are two sub-dictionaries: 'name', 'availlabilityo' which are also empty
+# INPUT JSON OBJECT: 
+#{
+#  "dataSourceId": "string",
+#  "availability": {
+#    "available": "Yes"
+#  },
+#  "courseRoleId": "Instructor"
+#}
+# assign command line arguments to the user_input dictionary key;value pairs
+# create EMPTY dictionary, and any second-level dict to hold all possible command line input variables
+ui = {}
+
+# only build the User Input dict if we are creating/PUT or updating/PATCH a USER enrollment record 
+# Add the key:value pairs into the EMPTY ui dict only if the value is not None
+# PATCH = update existing USER Enrollment record
+# PUT = create a new USER enrollment record
+if QTYPE == 'PUT' or QTYPE == 'PATCH':
+	ui['availability']={}
+	if args.role is not  None :
+		ui['courseRoleId'] = args.role
+	if args.availability is not None :
+		ui['availability']['available'] = args.availability
+
+# call function to strip out any keys with values = None from the ui dict save to new ui_json_dict dictionary
+# The resulting json_string is passed as DATA to the POST and PATCH API call
+ui_json_dict = strip_None_keys(ui)
+# ui_json_string is the DATA that we need to send to the API for either POST or PATCH methods
+ui_json_string = json.dumps(ui_json_dict)
+#print "JSON string = ", ui_json_string
+# END COMMAND LINE ARGUMENT PARSING 
+
+# SELECT the chosen target BB system based on command line arguments provided
+# LIVE = wccnet-LIVE.blackboard.com SaaS site
+if args.target == 'LIVE' :
+	appkey = saas_live_appkey
+	appsecret = saas_live_appsecret
+	app_server = saas_live_server
+
+## TEST = wccnet-test.blackboard.com SaaS site
+elif args.target == 'TEST' :
+	appkey = saas_test_appkey
+	appsecret = saas_test_appsecret
+	app_server = saas_test_server
+#
+## STAGE = wccnet-stage.blackboard.com SaaS site
+elif args.target == 'STAGE' :
+	appkey = saas_stage_appkey
+	appsecret = saas_stage_appsecret
+	app_server = saas_stage_server
+
+## SELECT default TARGET = LIVE if '-t TARGET' is not specified
+else : 
+	appkey = saas_live_appkey
+        appsecret = saas_live_appsecret
+        app_server = saas_live_server
+
+# Establish a requests session with the target app_server 
+# Call the bboauth() function from the bboauth module
+# pass the sessionid (s), the app_server, appkey, appsecret, and proxy setting to the function
+s = requests.session()
+s.verify = False
+result = bboauth(s, app_server, appkey, appsecret, prox)
+
+#######################
+# API FUNCTION Definitions 
+#######################
+# FUNC: apiget() accepts the SESSIONID, and the URI API endpoint to be queried using GET
+# returns the results (dictionary) rapi
+def apiget( bbsession, bburi ): 
+     #print "Get USERID, CALL GET API function:", bburi
+     rapi = bbsession.get( bburi )
+     #decoded = rapi.json()
+     #print "DECODED RES = ", decoded['results']
+     #print "HEADERS = ", rapi.headers
+     #print "LINK = ", rapi.links[ 'next']
+     return rapi
+
+# FUNC: apidel() accepts the SESSIONID, and the URI API endpoint to be DELETED 
+# returns the results (dictionary) rapi
+def apidel( bbsession, bburi ): 
+     rapi = bbsession.delete( bburi )
+     #decoded = rapi.json()
+     #print "DECODED RES = ", decoded
+     #print "HEADERS = ", rapi.headers
+     #print "LINK = ", rapi.links[ 'next']
+     print "RAPI = ", rapi
+     return rapi
+
+# FUNC: get_children()
+# A recursive function that calls itself to display any child content ( for a given parent content item) within a given course
+# Each time it is called recursively, we increment the TAB to indent printing of output, to indicate another level of recursion
+# Most course content items are limited to three levels: 1) Top/ToC content 2) child level1 3) child level2
+# Note: that one contentId can have multiple children, and each of those may have multiple children. Usually only to three levels deep
+def get_children(course_pk1, content_id, tabs):         	
+       	tab = tabs + '\t'
+        children_api_path = crs_Path + '/' + course_pk1 + "/contents/" + content_id + "/children"
+	resp = apiget(s, https + app_server + children_api_path )
+	child_json = resp.json()
+	if child_json.has_key('results'):
+		child_page = child_json['results']
+                print tab + "count of child content items in parent content item = ", len(child_page)  
+		for c in child_page:
+		       	ckeys = c.keys()
+                       	ccontentid = c['id']
+                        ctitle = c['title'] 
+              		print tab + "Child contentId, title =", ccontentid , ctitle
+                        get_children(course_pk1, ccontentid, tab) 
+	
+# FUNC: get_content(course_pk1) 
+# A function that obtains the list of TOP content items in a given course: the ToC (Table of Contents ) 
+def get_content(course_pk1):         	
+        content_api_path = crs_Path + '/' + course_pk1 + con_Path
+        #print "CONT PATH =", content_api_path 
+	resp = apiget(s, https + app_server + content_api_path )
+	top_json = resp.json()
+	if top_json.has_key('results'):
+		top_page = top_json['results']
+                print "number of top content items found in course = ", len(top_page)  
+		for t in top_page:
+		       	tkeys = t.keys()
+                        tcontentid = t['id']
+                        ttitle=t['title']
+                        print "Top contentId, title = ", tcontentid, ttitle
+                        get_children(course_pk1, tcontentid, "")
+	
+
+# Handle multiple or single RESULTS  after an API call
+def handle_results(resp_json):
+        if resp_json.has_key('results'):
+		list_results = resp_json['results']
+        	print "Number of ToC content records = ", len(list_results)
+        	for item in list_results:
+                # item['id'] contains the contentId of content belonging to the course. 
+                	content_id =  item['id']
+			print "MY CONTENT ID = ", content_id 
+                	print "CONTENT JSON =", item
+	else: 
+		print "single result = ", resp_json
+
+def handle_multi_results(resp_json):
+        if resp_json.has_key('results'):
+		list_results = resp_json['results']
+        	print "Number of COURSES matched = ", len(list_results)
+        	for item in list_results:
+                # item['id'] contains the courseId of a course which match courseId pattern
+                	course_id =  item['id']
+			print "COURSE_ID = ", course_id 
+                        get_content(course_id) 
+                        
+	else: 
+		print "single result = ", resp_json
+
+# Handle the various types of JSON responses from a GET api call
+# if the returned RESPONSE contains a 'paging' key we need to handle display of first 'results' list and GET next page of 'results'
+# if the returned RESPONSE contains a 'results' key we ned to handle display of each item 
+# if the returned RESPONSE contains only a single item we handle dislay of that single response item
+def handle_get_response(resp_json):
+	global APIPATH
+	if resp_json.has_key('paging') :
+        	#path,params = next_page.split("?")
+        	#fields,match,page = params.split("&")
+        	#next_page = path + "?" + page + "&" + match + "&" + fields 
+        	list_page = resp_json['results']
+        	#print "NEXT PAGE RESULTS: ", resp_json['results']
+ 	        for x in list_page:
+                    print x
+                # get the next page worth of data via another API call (fetch next page)
+                next_page = resp_json['paging']['nextPage']
+                response = apiget(s, https + app_server + next_page)
+                resp_json = response.json()
+                handle_results(resp_json)
+                print "NEXT page orig: ", next_page
+
+	# If only a single page of data is returned it will not include a 'paging' designation
+	# but it may include multiple records in the 'results' list
+        elif resp_json.has_key('results'):
+                #print "RES =", resp_json['results']
+		handle_results(resp_json)
+		# A single record might be returned in the response, print it out
+        else:
+                        print resp_json
+                        #print resp_json.keys()
+                        #print resp_json.values()
+
+def handle_multi_response(resp_json):
+	global APIPATH
+	if resp_json.has_key('paging') :
+        	#path,params = next_page.split("?")
+        	#fields,match,page = params.split("&")
+        	#next_page = path + "?" + page + "&" + match + "&" + fields 
+        	list_page = resp_json['results']
+        	#print "NEXT PAGE RESULTS: ", resp_json['results']
+ 	        for x in list_page:
+                    print x
+                # get the next page worth of data via another API call (fetch next page)
+                next_page = resp_json['paging']['nextPage']
+                response = apiget(s, https + app_server + next_page)
+                resp_json = response.json()
+                handle_multi_results(resp_json)
+                print "NEXT page orig: ", next_page
+
+	# If only a single page of data is returned it will not include a 'paging' designation
+	# but it may include multiple records in the 'results' list
+        elif resp_json.has_key('results'):
+                #print "RES =", resp_json['results']
+		handle_multi_results(resp_json)
+ 
+		# A single record might be returned in the response, print it out
+        else:
+                        print resp_json
+                        #print resp_json.keys()
+                        #print resp_json.values()
+
+# Call the appropriate API function based on the QTYPE
+# PATCH/update an existing course membership record
+if QTYPE == 'TOPGET':
+	#print "TOP GET =", https + app_server + APIPATH + FIELDS
+	response = apiget(s, https + app_server + APIPATH + FIELDS )
+	resp_json = response.json()
+        handle_get_response(resp_json)
+
+# Call DELETE API
+if QTYPE == 'DELETE':
+	print "DELETE =", https + app_server + APIPATH
+        response = apidel(s, https + app_server + APIPATH )
+        #resp_json = response.json()
+        #print "DELETE content response: ", resp_json
+
+# For a given COURSEID pattern list all content and content children ( hierarchy )
+elif QTYPE == 'LISTGET':
+	# User provided COURSEID pattern, for each courseId we get all top content items
+	response = apiget(s, https + app_server + APIPATH + FIELDS )
+	resp_json = response.json()
+        if resp_json.has_key('results'):
+		list_results = resp_json['results']
+        	print "Number of COURSES matching courseId = ", len(list_results)
+        	for item in list_results:
+                # item['id'] contains the courseId of a course which match courseId pattern
+                	course_pk1 = item['id']
+                        course_id  = item['courseId'] 
+			print '\n'
+                        print "Course PK1, Course ID = ", course_pk1, course_id
+			get_content(course_pk1)
+
+elif QTYPE == 'CHILDGET':
+        APIPATH = APIPATH + "/children"
+	print "CHILD GET =", https + app_server + APIPATH + FIELDS
+	response = apiget(s, https + app_server + APIPATH + FIELDS )
+	resp_json = response.json()
+        handle_get_response(resp_json)
+
+elif QTYPE == 'MULTIGET':
+	# User provided COURSEID pattern, for each courseId we get all top content items
+	response = apiget(s, https + app_server + APIPATH + FIELDS )
+	resp_json = response.json()
+        if resp_json.has_key('results'):
+		list_results = resp_json['results']
+        	print "Number of COURSES matched = ", len(list_results)
+        	for item in list_results:
+                # item['id'] contains the courseId of a course which match courseId pattern
+                	course_pk1 = item['id']
+                        course_id  = item['courseId'] 
+			print '\n'
+                        print "Course PK1, Course ID = ", course_pk1, course_id
+			get_content(course_pk1)
+
+elif QTYPE == 'GET':
+        # Default operation is a GET
+        print https + app_server + APIPATH + FIELDS 
+	response = apiget(s, https + app_server + APIPATH + FIELDS )
+        resp_json = response.json()
+        handle_get_response(resp_json)
+        #print "STATUS_CODE: ",  str(response.status_code)
+        #print "RESULTS: \n ",  json.dumps(resp_json)
+	#print "STATUS_CODE: ",  str(response.status_code)
+        #print "HEADER = ", str(response.headers)
+        #print "TEXT = ", str(response.text)
+        #print "RESP = ", str(response.json())
+        #print "ENCODING = ", str(response.encoding)
+        #print "RESULTS: \n ",  resp_json['results']
+        #print "id = ', resp_json['results']['id']
+        #print "children = ", resp_json['results'].['hasChildren']
+        #print 'parentId = ", resp_json['results'].['parentId']
